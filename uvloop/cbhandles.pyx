@@ -193,6 +193,7 @@ cdef class TimerHandle:
             loop, <method_t>self._run, self, delay)
 
         self.timer.start()
+        self._when = self.timer.get_when() * 1e-3
 
         # Only add to loop._timers when `self.timer` is successfully created
         loop._timers.add(self)
@@ -309,7 +310,7 @@ cdef class TimerHandle:
         self._cancel()
 
     def when(self):
-        return self.timer.get_when() * 1e-3
+        return self._when
 
 
 cdef format_callback_name(func):
@@ -413,7 +414,12 @@ cdef extract_stack():
     """Replacement for traceback.extract_stack() that only does the
     necessary work for asyncio debug mode.
     """
-    f = sys_getframe()
+    try:
+        f = sys_getframe()
+    # sys._getframe() might raise ValueError if being called without a frame, e.g.
+    # from Cython or similar C extensions.
+    except ValueError:
+        return None
     if f is None:
         return
 

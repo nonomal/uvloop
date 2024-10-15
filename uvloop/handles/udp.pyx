@@ -244,16 +244,15 @@ cdef class UDPTransport(UVBaseTransport):
                 ctx.close()
 
                 exc = convert_error(err)
-                self._fatal_error(exc, True)
+                if isinstance(exc, OSError):
+                    run_in_context1(self.context.copy(), self._protocol.error_received, exc)
+                else:
+                    self._fatal_error(exc, True)
             else:
                 self._maybe_pause_protocol()
 
         else:
-            if err < 0:
-                exc = convert_error(err)
-                self._fatal_error(exc, True)
-            else:
-                self._on_sent(None, self.context.copy())
+            self._on_sent(convert_error(err) if err < 0 else None, self.context.copy())
 
     cdef _on_receive(self, bytes data, object exc, object addr):
         if exc is None:
@@ -305,11 +304,13 @@ cdef class UDPTransport(UVBaseTransport):
         self._send(data, addr)
 
 
-cdef void __uv_udp_on_receive(uv.uv_udp_t* handle,
-                              ssize_t nread,
-                              const uv.uv_buf_t* buf,
-                              const system.sockaddr* addr,
-                              unsigned flags) with gil:
+cdef void __uv_udp_on_receive(
+    uv.uv_udp_t* handle,
+    ssize_t nread,
+    const uv.uv_buf_t* buf,
+    const system.sockaddr* addr,
+    unsigned flags
+) noexcept with gil:
 
     if __ensure_handle_data(<uv.uv_handle_t*>handle,
                             "UDPTransport receive callback") == 0:
@@ -348,9 +349,9 @@ cdef void __uv_udp_on_receive(uv.uv_udp_t* handle,
         pyaddr = None
     elif addr.sa_family == uv.AF_UNSPEC:
         # https://github.com/MagicStack/uvloop/issues/304
-        IF UNAME_SYSNAME == "Linux":
+        if system.PLATFORM_IS_LINUX:
             pyaddr = None
-        ELSE:
+        else:
             pyaddr = ''
     else:
         try:
@@ -375,7 +376,10 @@ cdef void __uv_udp_on_receive(uv.uv_udp_t* handle,
         udp._error(exc, False)
 
 
-cdef void __uv_udp_on_send(uv.uv_udp_send_t* req, int status) with gil:
+cdef void __uv_udp_on_send(
+    uv.uv_udp_send_t* req,
+    int status,
+) noexcept with gil:
 
     if req.data is NULL:
         # Shouldn't happen as:

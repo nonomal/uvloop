@@ -1,8 +1,8 @@
 import sys
 
 vi = sys.version_info
-if vi < (3, 7):
-    raise RuntimeError('uvloop requires Python 3.7 or greater')
+if vi < (3, 8):
+    raise RuntimeError('uvloop requires Python 3.8 or greater')
 
 if sys.platform in ('win32', 'cygwin', 'cli'):
     raise RuntimeError('uvloop does not support Windows at the moment')
@@ -17,45 +17,13 @@ import subprocess
 import sys
 
 from setuptools import setup, Extension
-from setuptools.command.build_ext import build_ext as build_ext
-from setuptools.command.sdist import sdist as sdist
+from setuptools.command.build_ext import build_ext
+from setuptools.command.sdist import sdist
 
 
-CYTHON_DEPENDENCY = 'Cython(>=0.29.24,<0.30.0)'
-
-# Minimal dependencies required to test uvloop.
-TEST_DEPENDENCIES = [
-    # pycodestyle is a dependency of flake8, but it must be frozen because
-    # their combination breaks too often
-    # (example breakage: https://gitlab.com/pycqa/flake8/issues/427)
-    'aiohttp',
-    'flake8~=3.9.2',
-    'psutil',
-    'pycodestyle~=2.7.0',
-    'pyOpenSSL~=19.0.0',
-    'mypy>=0.800',
-]
-
-# Dependencies required to build documentation.
-DOC_DEPENDENCIES = [
-    'Sphinx~=4.1.2',
-    'sphinxcontrib-asyncio~=0.3.0',
-    'sphinx_rtd_theme~=0.5.2',
-]
-
-EXTRA_DEPENDENCIES = {
-    'docs': DOC_DEPENDENCIES,
-    'test': TEST_DEPENDENCIES,
-    # Dependencies required to develop uvloop.
-    'dev': [
-        CYTHON_DEPENDENCY,
-        'pytest>=3.6.0',
-    ] + DOC_DEPENDENCIES + TEST_DEPENDENCIES
-}
-
-
+CYTHON_DEPENDENCY = 'Cython~=3.0'
 MACHINE = platform.machine()
-CFLAGS = ['-O2']
+MODULES_CFLAGS = [os.getenv('UVLOOP_OPT_CFLAGS', '-O2')]
 _ROOT = pathlib.Path(__file__).parent
 LIBUV_DIR = str(_ROOT / 'vendor' / 'libuv')
 LIBUV_BUILD_DIR = str(_ROOT / 'build' / 'libuv-{}'.format(MACHINE))
@@ -114,12 +82,6 @@ class uvloop_build_ext(build_ext):
     ]
 
     def initialize_options(self):
-        # initialize_options() may be called multiple times on the
-        # same command object, so make sure not to override previously
-        # set options.
-        if getattr(self, '_initialized', False):
-            return
-
         super().initialize_options()
         self.use_system_libuv = False
         self.cython_always = False
@@ -127,12 +89,6 @@ class uvloop_build_ext(build_ext):
         self.cython_directives = None
 
     def finalize_options(self):
-        # finalize_options() may be called multiple times on the
-        # same command object, so make sure not to override previously
-        # set options.
-        if getattr(self, '_initialized', False):
-            return
-
         need_cythonize = self.cython_always
         cfiles = {}
 
@@ -184,15 +140,16 @@ class uvloop_build_ext(build_ext):
                         v = True
 
                     directives[k] = v
+                self.cython_directives = directives
 
             self.distribution.ext_modules[:] = cythonize(
                 self.distribution.ext_modules,
                 compiler_directives=directives,
-                annotate=self.cython_annotate)
+                annotate=self.cython_annotate,
+                compile_time_env=dict(DEFAULT_FREELIST_SIZE=250),
+                emit_linenums=self.debug)
 
         super().finalize_options()
-
-        self._initialized = True
 
     def build_libuv(self):
         env = _libuv_build_env()
@@ -222,7 +179,11 @@ class uvloop_build_ext(build_ext):
             cmd,
             cwd=LIBUV_BUILD_DIR, env=env, check=True)
 
-        j_flag = '-j{}'.format(os.cpu_count() or 1)
+        try:
+            njobs = len(os.sched_getaffinity(0))
+        except AttributeError:
+            njobs = os.cpu_count()
+        j_flag = '-j{}'.format(njobs or 1)
         c_flag = "CFLAGS={}".format(env['CFLAGS'])
         subprocess.run(
             ['make', j_flag, c_flag],
@@ -258,10 +219,6 @@ class uvloop_build_ext(build_ext):
         super().build_extensions()
 
 
-with open(str(_ROOT / 'README.rst')) as f:
-    readme = f.read()
-
-
 with open(str(_ROOT / 'uvloop' / '_version.py')) as f:
     for line in f:
         if line.startswith('__version__ ='):
@@ -281,16 +238,7 @@ if not (_ROOT / 'uvloop' / 'loop.c').exists() or '--cython-always' in sys.argv:
 
 
 setup(
-    name='uvloop',
-    description='Fast implementation of asyncio event loop on top of libuv',
-    long_description=readme,
-    url='http://github.com/MagicStack/uvloop',
-    license='MIT',
-    author='Yury Selivanov',
-    author_email='yury@magic.io',
-    platforms=['macOS', 'POSIX'],
     version=VERSION,
-    packages=['uvloop'],
     cmdclass={
         'sdist': uvloop_sdist,
         'build_ext': uvloop_build_ext
@@ -301,23 +249,8 @@ setup(
             sources=[
                 "uvloop/loop.pyx",
             ],
-            extra_compile_args=CFLAGS
+            extra_compile_args=MODULES_CFLAGS
         ),
     ],
-    classifiers=[
-        'Development Status :: 5 - Production/Stable',
-        'Framework :: AsyncIO',
-        'Programming Language :: Python :: 3 :: Only',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'License :: OSI Approved :: Apache Software License',
-        'License :: OSI Approved :: MIT License',
-        'Intended Audience :: Developers',
-    ],
-    include_package_data=True,
-    extras_require=EXTRA_DEPENDENCIES,
     setup_requires=setup_requires,
-    python_requires='>=3.7',
 )

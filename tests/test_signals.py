@@ -3,8 +3,6 @@ import signal
 import subprocess
 import sys
 import time
-import unittest
-import uvloop
 
 from uvloop import _testbase as tb
 
@@ -310,7 +308,7 @@ finally:
         with self.assertRaisesRegex(TypeError, 'coroutines cannot be used'):
             self.loop.add_signal_handler(signal.SIGHUP, coro)
 
-    def test_wakeup_fd_unchanged(self):
+    def test_signals_wakeup_fd_unchanged(self):
         async def runner():
             PROG = R"""\
 import uvloop
@@ -349,6 +347,42 @@ print(fd0 == fd1, flush=True)
 
         self.loop.run_until_complete(runner())
 
+    def test_signals_fork_in_thread(self):
+        # Refs #452, when forked from a thread, the main-thread-only signal
+        # operations failed thread ID checks because we didn't update
+        # MAIN_THREAD_ID after fork. It's now a lazy value set when needed and
+        # cleared after fork.
+        PROG = R"""\
+import asyncio
+import multiprocessing
+import signal
+import sys
+import threading
+import uvloop
+
+multiprocessing.set_start_method('fork')
+
+def subprocess():
+    loop = """ + self.NEW_LOOP + """
+    loop.add_signal_handler(signal.SIGINT, lambda *a: None)
+
+def run():
+    loop = """ + self.NEW_LOOP + """
+    loop.add_signal_handler(signal.SIGINT, lambda *a: None)
+    p = multiprocessing.Process(target=subprocess)
+    t = threading.Thread(target=p.start)
+    t.start()
+    t.join()
+    p.join()
+    sys.exit(p.exitcode)
+
+run()
+"""
+
+        subprocess.check_call([
+            sys.executable, b'-W', b'ignore', b'-c', PROG,
+        ])
+
 
 class Test_UV_Signals(_TestSignal, tb.UVTestCase):
     NEW_LOOP = 'uvloop.new_event_loop()'
@@ -358,23 +392,6 @@ class Test_UV_Signals(_TestSignal, tb.UVTestCase):
                                     r"cannot add.*handler.*SIGCHLD"):
 
             self.loop.add_signal_handler(signal.SIGCHLD, lambda *a: None)
-
-    @unittest.skipIf(sys.version_info[:3] >= (3, 8, 0),
-                     'in 3.8 a ThreadedChildWatcher is used '
-                     '(does not rely on SIGCHLD)')
-    def test_asyncio_add_watcher_SIGCHLD_nop(self):
-        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-        asyncio.get_event_loop_policy().get_child_watcher()
-
-        try:
-            loop = uvloop.new_event_loop()
-            with self.assertWarnsRegex(
-                    RuntimeWarning,
-                    "asyncio is trying to install its ChildWatcher"):
-                asyncio.set_event_loop(loop)
-        finally:
-            asyncio.set_event_loop(None)
-            loop.close()
 
 
 class Test_AIO_Signals(_TestSignal, tb.AIOTestCase):

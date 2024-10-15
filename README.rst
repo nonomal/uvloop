@@ -1,5 +1,5 @@
-.. image:: https://img.shields.io/github/workflow/status/MagicStack/uvloop/Tests
-    :target: https://github.com/MagicStack/uvloop/actions?query=workflow%3ATests+branch%3Amaster
+.. image:: https://img.shields.io/github/actions/workflow/status/MagicStack/uvloop/tests.yml?branch=master
+    :target: https://github.com/MagicStack/uvloop/actions/workflows/tests.yml?query=branch%3Amaster
 
 .. image:: https://img.shields.io/pypi/v/uvloop.svg
     :target: https://pypi.python.org/pypi/uvloop
@@ -39,7 +39,7 @@ about it.
 Installation
 ------------
 
-uvloop requires Python 3.7 or greater and is available on PyPI.
+uvloop requires Python 3.8 or greater and is available on PyPI.
 Use pip to install it::
 
     $ pip install uvloop
@@ -53,26 +53,50 @@ uvloop with::
 Using uvloop
 ------------
 
-Call ``uvloop.install()`` before calling ``asyncio.run()`` or
-manually creating an asyncio event loop:
+As of uvloop 0.18, the preferred way of using it is via the
+``uvloop.run()`` helper function:
+
 
 .. code:: python
 
-    import asyncio
     import uvloop
 
     async def main():
         # Main entry-point.
         ...
 
-    uvloop.install()
-    asyncio.run(main())
+    uvloop.run(main())
+
+``uvloop.run()`` works by simply configuring ``asyncio.run()``
+to use uvloop, passing all of the arguments to it, such as ``debug``,
+e.g. ``uvloop.run(main(), debug=True)``.
+
+With Python 3.11 and earlier the following alternative
+snippet can be used:
+
+.. code:: python
+
+    import asyncio
+    import sys
+
+    import uvloop
+
+    async def main():
+        # Main entry-point.
+        ...
+
+    if sys.version_info >= (3, 11):
+        with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
+            runner.run(main())
+    else:
+        uvloop.install()
+        asyncio.run(main())
 
 
 Building From Source
 --------------------
 
-To build uvloop, you'll need Python 3.7 or greater:
+To build uvloop, you'll need Python 3.8 or greater:
 
 1. Clone the repository:
 
@@ -85,7 +109,7 @@ To build uvloop, you'll need Python 3.7 or greater:
 
    .. code::
 
-    $ python3.7 -m venv uvloop-dev
+    $ python3 -m venv uvloop-dev
     $ source uvloop-dev/bin/activate
 
 3. Install development dependencies:

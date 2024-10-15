@@ -540,7 +540,9 @@ class _TestBase:
         async def coro():
             pass
 
-        factory = lambda loop, coro: MyTask(coro, loop=loop)
+        factory = lambda loop, coro, **kwargs: MyTask(
+            coro, loop=loop, **kwargs
+        )
 
         self.assertIsNone(self.loop.get_task_factory())
         self.loop.set_task_factory(factory)
@@ -559,9 +561,6 @@ class _TestBase:
         self.loop.run_until_complete(task)
 
     def test_set_task_name(self):
-        if self.implementation == 'asyncio' and sys.version_info < (3, 8, 0):
-            raise unittest.SkipTest('unsupported task name')
-
         self.loop._process_events = mock.Mock()
 
         result = None
@@ -577,13 +576,14 @@ class _TestBase:
         async def coro():
             pass
 
-        factory = lambda loop, coro: MyTask(coro, loop=loop)
+        factory = lambda loop, coro, **kwargs: MyTask(
+            coro, loop=loop, **kwargs
+        )
 
         self.assertIsNone(self.loop.get_task_factory())
         task = self.loop.create_task(coro(), name="mytask")
         self.assertFalse(isinstance(task, MyTask))
-        if sys.version_info >= (3, 8, 0):
-            self.assertEqual(task.get_name(), "mytask")
+        self.assertEqual(task.get_name(), "mytask")
         self.loop.run_until_complete(task)
 
         self.loop.set_task_factory(factory)
@@ -860,6 +860,14 @@ class TestBaseUV(_TestBase, UVTestCase):
         self.assertAlmostEqual(handle.when(), loop_t + delay, places=2)
         handle.cancel()
         self.assertTrue(handle.cancelled())
+        self.assertAlmostEqual(handle.when(), loop_t + delay, places=2)
+
+    def test_loop_call_later_handle_when_after_fired(self):
+        fut = self.loop.create_future()
+        handle = self.loop.call_later(0.05, fut.set_result, None)
+        when = handle.when()
+        self.loop.run_until_complete(fut)
+        self.assertEqual(handle.when(), when)
 
 
 class TestBaseAIO(_TestBase, AIOTestCase):

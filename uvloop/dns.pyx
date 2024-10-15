@@ -245,7 +245,44 @@ cdef __static_getaddrinfo_pyaddr(object host, object port,
     except Exception:
         return
 
-    return af, type, proto, '', pyaddr
+    # When the host is an IP while type is one of TCP or UDP, different libc
+    # implementations of getaddrinfo() behave differently:
+    # 1. When AI_CANONNAME is set:
+    #    * glibc: returns ai_canonname
+    #    * musl: returns ai_canonname
+    #    * macOS: returns an empty string for ai_canonname
+    # 2. When AI_CANONNAME is NOT set:
+    #    * glibc: returns an empty string for ai_canonname
+    #    * musl: returns ai_canonname
+    #    * macOS: returns an empty string for ai_canonname
+    # At the same time, libuv and CPython both uses libc directly, even though
+    # this different behavior is violating what is in the documentation.
+    #
+    # uvloop potentially should be a 100% drop-in replacement for asyncio,
+    # doing whatever asyncio does, especially when the libc implementations are
+    # also different in the same way. However, making our implementation to be
+    # consistent with libc/CPython would be complex and hard to maintain
+    # (including caching libc behaviors when flag is/not set), therefore we
+    # decided to simply normalize the behavior in uvloop for this very marginal
+    # case following the documentation, even though uvloop would behave
+    # differently to asyncio on macOS and musl platforms, when again the host
+    # is an IP and type is one of TCP or UDP.
+    # All other cases are still asyncio-compatible.
+    if flags & socket_AI_CANONNAME:
+        if isinstance(host, str):
+            canon_name = host
+        else:
+            canon_name = host.decode('ascii')
+    else:
+        canon_name = ''
+
+    return (
+        _intenum_converter(af, socket_AddressFamily),
+        _intenum_converter(type, socket_SocketKind),
+        proto,
+        canon_name,
+        pyaddr,
+    )
 
 
 @cython.freelist(DEFAULT_FREELIST_SIZE)
@@ -261,7 +298,7 @@ cdef class AddrInfo:
             uv.uv_freeaddrinfo(self.data)  # returns void
             self.data = NULL
 
-    cdef void set_data(self, system.addrinfo *data):
+    cdef void set_data(self, system.addrinfo *data) noexcept:
         self.data = data
 
     cdef unpack(self):
@@ -276,8 +313,8 @@ cdef class AddrInfo:
         while ptr != NULL:
             if ptr.ai_addr.sa_family in (uv.AF_INET, uv.AF_INET6):
                 result.append((
-                    ptr.ai_family,
-                    ptr.ai_socktype,
+                    _intenum_converter(ptr.ai_family, socket_AddressFamily),
+                    _intenum_converter(ptr.ai_socktype, socket_SocketKind),
                     ptr.ai_protocol,
                     ('' if ptr.ai_canonname is NULL else
                         (<bytes>ptr.ai_canonname).decode()),
@@ -311,6 +348,11 @@ cdef class AddrInfoRequest(UVRequest):
 
         if host is None:
             chost = NULL
+        elif host == b'' and sys.platform == 'darwin':
+            # It seems `getaddrinfo("", ...)` on macOS is equivalent to
+            # `getaddrinfo("localhost", ...)`. This is inconsistent with
+            # libuv 1.48 which treats empty nodename as EINVAL.
+            chost = <char*>'localhost'
         else:
             chost = <char*>host
 
@@ -318,13 +360,6 @@ cdef class AddrInfoRequest(UVRequest):
             cport = NULL
         else:
             cport = <char*>port
-
-        if cport is NULL and chost is NULL:
-            self.on_done()
-            msg = system.gai_strerror(socket_EAI_NONAME).decode('utf-8')
-            ex = socket_gaierror(socket_EAI_NONAME, msg)
-            callback(ex)
-            return
 
         memset(&self.hints, 0, sizeof(system.addrinfo))
         self.hints.ai_flags = flags
@@ -345,7 +380,17 @@ cdef class AddrInfoRequest(UVRequest):
 
         if err < 0:
             self.on_done()
-            callback(convert_error(err))
+            try:
+                if err == uv.UV_EINVAL:
+                    # Convert UV_EINVAL to EAI_NONAME to match libc behavior
+                    msg = system.gai_strerror(socket_EAI_NONAME).decode('utf-8')
+                    ex = socket_gaierror(socket_EAI_NONAME, msg)
+                else:
+                    ex = convert_error(err)
+            except Exception as ex:
+                callback(ex)
+            else:
+                callback(ex)
 
 
 cdef class NameInfoRequest(UVRequest):
@@ -370,8 +415,18 @@ cdef class NameInfoRequest(UVRequest):
             self.callback(convert_error(err))
 
 
-cdef void __on_addrinfo_resolved(uv.uv_getaddrinfo_t *resolver,
-                                 int status, system.addrinfo *res) with gil:
+cdef _intenum_converter(value, enum_klass):
+    try:
+        return enum_klass(value)
+    except ValueError:
+        return value
+
+
+cdef void __on_addrinfo_resolved(
+    uv.uv_getaddrinfo_t *resolver,
+    int status,
+    system.addrinfo *res,
+) noexcept with gil:
 
     if resolver.data is NULL:
         aio_logger.error(
@@ -399,10 +454,12 @@ cdef void __on_addrinfo_resolved(uv.uv_getaddrinfo_t *resolver,
         request.on_done()
 
 
-cdef void __on_nameinfo_resolved(uv.uv_getnameinfo_t* req,
-                                 int status,
-                                 const char* hostname,
-                                 const char* service) with gil:
+cdef void __on_nameinfo_resolved(
+    uv.uv_getnameinfo_t* req,
+    int status,
+    const char* hostname,
+    const char* service,
+) noexcept with gil:
     cdef:
         NameInfoRequest request = <NameInfoRequest> req.data
         Loop loop = request.loop

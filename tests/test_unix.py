@@ -10,6 +10,9 @@ import sys
 from uvloop import _testbase as tb
 
 
+SSL_HANDSHAKE_TIMEOUT = 15.0
+
+
 class _TestUnix:
     def test_create_unix_server_1(self):
         CNT = 0           # number of clients that were successful
@@ -78,16 +81,33 @@ class _TestUnix:
                     self.loop.call_soon(srv.close)
                     await srv.wait_closed()
 
+                    if (
+                        self.implementation == 'asyncio'
+                        and sys.version_info[:3] >= (3, 12, 0)
+                    ):
+                        # asyncio regression in 3.12 -- wait_closed()
+                        # doesn't wait for `close()` to actually complete.
+                        # https://github.com/python/cpython/issues/79033
+                        await asyncio.sleep(1)
+
                     # Check that the server cleaned-up proxy-sockets
                     for srv_sock in srv_socks:
                         self.assertEqual(srv_sock.fileno(), -1)
 
                     self.assertFalse(srv.is_serving())
 
-                # asyncio doesn't cleanup the sock file
-                self.assertTrue(os.path.exists(sock_name))
+                if sys.version_info < (3, 13):
+                    # asyncio doesn't cleanup the sock file under Python 3.13
+                    self.assertTrue(os.path.exists(sock_name))
+                else:
+                    self.assertFalse(os.path.exists(sock_name))
 
-        async def start_server_sock(start_server):
+        async def start_server_sock(start_server, is_unix_api=True):
+            # is_unix_api indicates whether `start_server` is calling
+            # `loop.create_unix_server()` or `loop.create_server()`,
+            # because asyncio `loop.create_server()` doesn't cleanup
+            # the socket file even if it's a UNIX socket.
+
             nonlocal CNT
             CNT = 0
 
@@ -113,14 +133,26 @@ class _TestUnix:
                     self.loop.call_soon(srv.close)
                     await srv.wait_closed()
 
+                    if (
+                        self.implementation == 'asyncio'
+                        and sys.version_info[:3] >= (3, 12, 0)
+                    ):
+                        # asyncio regression in 3.12 -- wait_closed()
+                        # doesn't wait for `close()` to actually complete.
+                        # https://github.com/python/cpython/issues/79033
+                        await asyncio.sleep(1)
+
                     # Check that the server cleaned-up proxy-sockets
                     for srv_sock in srv_socks:
                         self.assertEqual(srv_sock.fileno(), -1)
 
                     self.assertFalse(srv.is_serving())
 
-                # asyncio doesn't cleanup the sock file
-                self.assertTrue(os.path.exists(sock_name))
+                if sys.version_info < (3, 13) or not is_unix_api:
+                    # asyncio doesn't cleanup the sock file under Python 3.13
+                    self.assertTrue(os.path.exists(sock_name))
+                else:
+                    self.assertFalse(os.path.exists(sock_name))
 
         with self.subTest(func='start_unix_server(host, port)'):
             self.loop.run_until_complete(start_server())
@@ -139,7 +171,7 @@ class _TestUnix:
                 lambda sock: asyncio.start_server(
                     handle_client,
                     None, None,
-                    sock=sock)))
+                    sock=sock), is_unix_api=False))
             self.assertEqual(CNT, TOTAL_CNT)
 
     def test_create_unix_server_2(self):
@@ -160,7 +192,8 @@ class _TestUnix:
                 ValueError, 'ssl_handshake_timeout is only meaningful'):
             self.loop.run_until_complete(
                 self.loop.create_unix_server(
-                    lambda: None, path='/tmp/a', ssl_handshake_timeout=10))
+                    lambda: None, path='/tmp/a',
+                    ssl_handshake_timeout=SSL_HANDSHAKE_TIMEOUT))
 
     def test_create_unix_server_existing_path_sock(self):
         with self.unix_sock_name() as path:
@@ -368,7 +401,8 @@ class _TestUnix:
                 ValueError, 'ssl_handshake_timeout is only meaningful'):
             self.loop.run_until_complete(
                 self.loop.create_unix_connection(
-                    lambda: None, path='/tmp/a', ssl_handshake_timeout=10))
+                    lambda: None, path='/tmp/a',
+                    ssl_handshake_timeout=SSL_HANDSHAKE_TIMEOUT))
 
 
 class Test_UV_Unix(_TestUnix, tb.UVTestCase):
@@ -432,16 +466,13 @@ class Test_UV_Unix(_TestUnix, tb.UVTestCase):
             socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_NONBLOCK)
         with tempfile.NamedTemporaryFile() as file:
             fn = file.name
-        try:
-            with sock:
-                sock.bind(fn)
-                coro = self.loop.create_unix_server(lambda: None, path=None,
-                                                    sock=sock)
-                srv = self.loop.run_until_complete(coro)
-                srv.close()
-                self.loop.run_until_complete(srv.wait_closed())
-        finally:
-            os.unlink(fn)
+        with sock:
+            sock.bind(fn)
+            coro = self.loop.create_unix_server(lambda: None, path=None,
+                                                sock=sock, cleanup_socket=True)
+            srv = self.loop.run_until_complete(coro)
+            srv.close()
+            self.loop.run_until_complete(srv.wait_closed())
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires epoll')
     def test_epollhup(self):
@@ -567,7 +598,7 @@ class _TestSSL(tb.SSLTestCase):
             await fut
 
         async def start_server():
-            extras = dict(ssl_handshake_timeout=10.0)
+            extras = dict(ssl_handshake_timeout=SSL_HANDSHAKE_TIMEOUT)
 
             with tempfile.TemporaryDirectory() as td:
                 sock_name = os.path.join(td, 'sock')
@@ -628,7 +659,7 @@ class _TestSSL(tb.SSLTestCase):
             sock.close()
 
         async def client(addr):
-            extras = dict(ssl_handshake_timeout=10.0)
+            extras = dict(ssl_handshake_timeout=SSL_HANDSHAKE_TIMEOUT)
 
             reader, writer = await asyncio.open_unix_connection(
                 addr,

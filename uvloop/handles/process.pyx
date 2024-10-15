@@ -7,7 +7,7 @@ cdef class UVProcess(UVHandle):
         self.uv_opt_args = NULL
         self._returncode = None
         self._pid = None
-        self._fds_to_close = set()
+        self._fds_to_close = list()
         self._preexec_fn = None
         self._restore_signals = True
         self.context = Context_CopyCurrent()
@@ -46,9 +46,17 @@ cdef class UVProcess(UVHandle):
         # callbacks have a chance to avoid casting *something* into UVHandle.
         self._handle.data = NULL
 
+        force_fork = False
+        if system.PLATFORM_IS_APPLE and not (
+            preexec_fn is None
+            and not pass_fds
+        ):
+            # see _execute_child() in CPython/subprocess.py
+            force_fork = True
+
         try:
             self._init_options(args, env, cwd, start_new_session,
-                               _stdin, _stdout, _stderr)
+                               _stdin, _stdout, _stderr, force_fork)
 
             restore_inheritable = set()
             if pass_fds:
@@ -69,6 +77,11 @@ cdef class UVProcess(UVHandle):
                 'Racing with another loop to spawn a process.')
 
         self._errpipe_read, self._errpipe_write = os_pipe()
+        fds_to_close = self._fds_to_close
+        self._fds_to_close = None
+        fds_to_close.append(self._errpipe_read)
+        # add the write pipe last so we can close it early
+        fds_to_close.append(self._errpipe_write)
         try:
             os_set_inheritable(self._errpipe_write, True)
 
@@ -100,7 +113,8 @@ cdef class UVProcess(UVHandle):
 
             self._finish_init()
 
-            os_close(self._errpipe_write)
+            # close the write pipe early
+            os_close(fds_to_close.pop())
 
             if preexec_fn is not None:
                 errpipe_data = bytearray()
@@ -114,17 +128,8 @@ cdef class UVProcess(UVHandle):
                         break
 
         finally:
-            os_close(self._errpipe_read)
-            try:
-                os_close(self._errpipe_write)
-            except OSError:
-                # Might be already closed
-                pass
-
-            fds_to_close = self._fds_to_close
-            self._fds_to_close = None
-            for fd in fds_to_close:
-                os_close(fd)
+            while fds_to_close:
+                os_close(fds_to_close.pop())
 
             for fd in restore_inheritable:
                 os_set_inheritable(fd, False)
@@ -201,7 +206,7 @@ cdef class UVProcess(UVHandle):
         if self._fds_to_close is None:
             raise RuntimeError(
                 'UVProcess._close_after_spawn called after uv_spawn')
-        self._fds_to_close.add(fd)
+        self._fds_to_close.append(fd)
 
     def __dealloc__(self):
         if self.uv_opt_env is not NULL:
@@ -220,9 +225,6 @@ cdef class UVProcess(UVHandle):
 
             char **ret
 
-        if UVLOOP_DEBUG:
-            assert arr_len > 0
-
         ret = <char **>PyMem_RawMalloc((arr_len + 1) * sizeof(char *))
         if ret is NULL:
             raise MemoryError()
@@ -238,7 +240,7 @@ cdef class UVProcess(UVHandle):
         return ret
 
     cdef _init_options(self, list args, dict env, cwd, start_new_session,
-                       _stdin, _stdout, _stderr):
+                       _stdin, _stdout, _stderr, bint force_fork):
 
         memset(&self.options, 0, sizeof(uv.uv_process_options_t))
 
@@ -251,6 +253,21 @@ cdef class UVProcess(UVHandle):
 
         if start_new_session:
             self.options.flags |= uv.UV_PROCESS_DETACHED
+
+        if force_fork:
+            # This is a hack to work around the change in libuv 1.44:
+            #    > macos: use posix_spawn instead of fork
+            # where Python subprocess options like preexec_fn are
+            # crippled. CPython only uses posix_spawn under a pretty
+            # strict list of conditions (see subprocess.py), and falls
+            # back to using fork() otherwise. We'd like to simulate such
+            # behavior with libuv, but unfortunately libuv doesn't
+            # provide explicit API to choose such implementation detail.
+            # Based on current (libuv 1.46) behavior, setting
+            # UV_PROCESS_SETUID or UV_PROCESS_SETGID would reliably make
+            # libuv fallback to use fork, so let's just use it for now.
+            self.options.flags |= uv.UV_PROCESS_SETUID
+            self.options.uid = uv.getuid()
 
         if cwd is not None:
             cwd = os_fspath(cwd)
@@ -288,7 +305,7 @@ cdef class UVProcess(UVHandle):
         self.uv_opt_args = self.__to_cstring_array(self.__args)
 
     cdef _init_env(self, dict env):
-        if env is not None and len(env):
+        if env is not None:
             self.__env = list()
             for key in env:
                 val = env[key]
@@ -499,10 +516,7 @@ cdef class UVProcessTransport(UVProcess):
                     # shouldn't ever happen
                     raise RuntimeError('cannot apply subprocess.STDOUT')
 
-                newfd = os_dup(io[1])
-                os_set_inheritable(newfd, True)
-                self._close_after_spawn(newfd)
-                io[2] = newfd
+                io[2] = self._file_redirect_stdio(io[1])
             elif _stderr == subprocess_DEVNULL:
                 io[2] = self._file_devnull()
             else:
@@ -739,9 +753,11 @@ cdef __process_convert_fileno(object obj):
     return fileno
 
 
-cdef void __uvprocess_on_exit_callback(uv.uv_process_t *handle,
-                                       int64_t exit_status,
-                                       int term_signal) with gil:
+cdef void __uvprocess_on_exit_callback(
+    uv.uv_process_t *handle,
+    int64_t exit_status,
+    int term_signal,
+) noexcept with gil:
 
     if __ensure_handle_data(<uv.uv_handle_t*>handle,
                             "UVProcess exit callback") == 0:
@@ -770,5 +786,7 @@ cdef __socketpair():
     return fds[0], fds[1]
 
 
-cdef void __uv_close_process_handle_cb(uv.uv_handle_t* handle) with gil:
+cdef void __uv_close_process_handle_cb(
+    uv.uv_handle_t* handle
+) noexcept with gil:
     PyMem_RawFree(handle)

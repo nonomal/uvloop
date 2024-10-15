@@ -1,5 +1,6 @@
 from libc.stdint cimport uint16_t, uint32_t, uint64_t, int64_t
 from posix.types cimport gid_t, uid_t
+from posix.unistd cimport getuid
 
 from . cimport system
 
@@ -56,7 +57,7 @@ cdef extern from "uv.h" nogil:
     cdef int SOL_SOCKET
     cdef int SO_ERROR
     cdef int SO_REUSEADDR
-    cdef int SO_REUSEPORT
+    # use has_SO_REUSEPORT and SO_REUSEPORT in stdlib.pxi instead
     cdef int AF_INET
     cdef int AF_INET6
     cdef int AF_UNIX
@@ -183,6 +184,10 @@ cdef extern from "uv.h" nogil:
         int pid
         # ...
 
+    ctypedef struct uv_fs_event_t:
+        void* data
+        # ...
+
     ctypedef enum uv_req_type:
         UV_UNKNOWN_REQ = 0,
         UV_REQ,
@@ -214,6 +219,10 @@ cdef extern from "uv.h" nogil:
     ctypedef enum uv_membership:
         UV_LEAVE_GROUP = 0,
         UV_JOIN_GROUP
+
+    cdef enum uv_fs_event:
+        UV_RENAME = 1,
+        UV_CHANGE = 2
 
     const char* uv_strerror(int err)
     const char* uv_err_name(int err)
@@ -253,6 +262,10 @@ cdef extern from "uv.h" nogil:
                                     const uv_buf_t* buf,
                                     const system.sockaddr* addr,
                                     unsigned flags) with gil
+    ctypedef void (*uv_fs_event_cb)(uv_fs_event_t* handle,
+                                    const char *filename,
+                                    int events,
+                                    int status) with gil
 
     # Generic request functions
     int uv_cancel(uv_req_t* req)
@@ -269,7 +282,7 @@ cdef extern from "uv.h" nogil:
     int uv_loop_close(uv_loop_t* loop)
     int uv_loop_alive(uv_loop_t* loop)
     int uv_loop_fork(uv_loop_t* loop)
-    int uv_backend_fd(uv_loop_t* loop)
+    uv_os_fd_t uv_backend_fd(uv_loop_t* loop)
 
     void uv_update_time(uv_loop_t* loop)
     uint64_t uv_now(const uv_loop_t*)
@@ -365,7 +378,7 @@ cdef extern from "uv.h" nogil:
     # Pipes
 
     int uv_pipe_init(uv_loop_t* loop, uv_pipe_t* handle, int ipc)
-    int uv_pipe_open(uv_pipe_t* handle, uv_file file)
+    int uv_pipe_open(uv_pipe_t* handle, uv_os_fd_t file)
     int uv_pipe_bind(uv_pipe_t* handle, const char* name)
 
     void uv_pipe_connect(uv_connect_t* req, uv_pipe_t* handle,
@@ -396,6 +409,13 @@ cdef extern from "uv.h" nogil:
                             uv_os_sock_t socket)
     int uv_poll_start(uv_poll_t* handle, int events, uv_poll_cb cb)
     int uv_poll_stop(uv_poll_t* poll)
+
+    # FS Event
+
+    int uv_fs_event_init(uv_loop_t *loop, uv_fs_event_t *handle)
+    int uv_fs_event_start(uv_fs_event_t *handle, uv_fs_event_cb cb,
+                          const char *path, unsigned int flags)
+    int uv_fs_event_stop(uv_fs_event_t *handle)
 
     # Misc
 
@@ -482,3 +502,5 @@ cdef extern from "uv.h" nogil:
                  const uv_process_options_t* options)
 
     int uv_process_kill(uv_process_t* handle, int signum)
+
+    unsigned int uv_version()

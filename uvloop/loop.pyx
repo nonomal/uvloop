@@ -38,17 +38,19 @@ from cpython cimport (
     PyBytes_AsStringAndSize,
     Py_SIZE, PyBytes_AS_STRING, PyBUF_WRITABLE
 )
+from cpython.pycapsule cimport PyCapsule_New, PyCapsule_GetPointer
 
 from . import _noop
 
 
-include "includes/consts.pxi"
 include "includes/stdlib.pxi"
 
 include "errors.pyx"
 
 cdef:
     int PY39 = PY_VERSION_HEX >= 0x03090000
+    int PY311 = PY_VERSION_HEX >= 0x030b0000
+    int PY313 = PY_VERSION_HEX >= 0x030d0000
     uint64_t MAX_SLEEP = 3600 * 24 * 365 * 100
 
 
@@ -92,7 +94,7 @@ cdef inline socket_dec_io_ref(sock):
 cdef inline run_in_context(context, method):
     # This method is internally used to workaround a reference issue that in
     # certain circumstances, inlined context.run() will not hold a reference to
-    # the given method instance, which - if deallocated - will cause segault.
+    # the given method instance, which - if deallocated - will cause segfault.
     # See also: edgedb/edgedb#2222
     Py_INCREF(method)
     try:
@@ -141,7 +143,6 @@ cdef class Loop:
 
         self._closed = 0
         self._debug = 0
-        self._thread_is_main = 0
         self._thread_id = 0
         self._running = 0
         self._stopping = 0
@@ -154,6 +155,8 @@ cdef class Loop:
         # This is how the selector module and hence asyncio behaves.
         self._fd_to_reader_fileobj = {}
         self._fd_to_writer_fileobj = {}
+
+        self._unix_server_sockets = {}
 
         self._timers = set()
         self._polls = {}
@@ -176,6 +179,7 @@ cdef class Loop:
         self._default_executor = None
 
         self._queued_streams = set()
+        self._executing_streams = set()
         self._ready = col_deque()
         self._ready_len = 0
 
@@ -215,11 +219,16 @@ cdef class Loop:
         self._servers = set()
 
     cdef inline _is_main_thread(self):
-        return MAIN_THREAD_ID == PyThread_get_thread_ident()
+        cdef uint64_t main_thread_id = system.MAIN_THREAD_ID
+        if system.MAIN_THREAD_ID_SET == 0:
+            main_thread_id = <uint64_t>threading_main_thread().ident
+            system.setMainThreadID(main_thread_id)
+        return main_thread_id == PyThread_get_thread_ident()
 
     def __init__(self):
-        self.set_debug((not sys_ignore_environment
-                        and bool(os_environ.get('PYTHONASYNCIODEBUG'))))
+        self.set_debug(
+            sys_dev_mode or (not sys_ignore_environment
+                             and bool(os_environ.get('PYTHONASYNCIODEBUG'))))
 
     def __dealloc__(self):
         if self._running == 1:
@@ -519,7 +528,6 @@ cdef class Loop:
         self._last_error = None
 
         self._thread_id = PyThread_get_thread_ident()
-        self._thread_is_main = MAIN_THREAD_ID == self._thread_id
         self._running = 1
 
         self.handler_check__exec_writes.start()
@@ -540,7 +548,6 @@ cdef class Loop:
 
             self._pause_signals()
 
-            self._thread_is_main = 0
             self._thread_id = 0
             self._running = 0
             self._stopping = 0
@@ -641,25 +648,20 @@ cdef class Loop:
 
         cdef:
             UVStream stream
-            int queued_len
 
-        if UVLOOP_DEBUG:
-            queued_len = len(self._queued_streams)
-
-        for pystream in self._queued_streams:
-            stream = <UVStream>pystream
-            stream._exec_write()
-
-        if UVLOOP_DEBUG:
-            if len(self._queued_streams) != queued_len:
-                raise RuntimeError(
-                    'loop._queued_streams are not empty after '
-                    '_exec_queued_writes')
-
-        self._queued_streams.clear()
+        streams = self._queued_streams
+        self._queued_streams = self._executing_streams
+        self._executing_streams = streams
+        try:
+            for pystream in streams:
+                stream = <UVStream>pystream
+                stream._exec_write()
+        finally:
+            streams.clear()
 
         if self.handler_check__exec_writes.running:
-            self.handler_check__exec_writes.stop()
+            if len(self._queued_streams) == 0:
+                self.handler_check__exec_writes.stop()
 
     cdef inline _call_soon(self, object callback, object args, object context):
         cdef Handle handle
@@ -707,7 +709,7 @@ cdef class Loop:
             return
 
         cdef uint64_t thread_id
-        thread_id = <uint64_t><int64_t>PyThread_get_thread_ident()
+        thread_id = <uint64_t>PyThread_get_thread_ident()
 
         if thread_id != self._thread_id:
             raise RuntimeError(
@@ -1118,7 +1120,7 @@ cdef class Loop:
 
     cdef _sock_set_reuseport(self, int fd):
         cdef:
-            int err
+            int err = 0
             int reuseport_flag = 1
 
         err = system.setsockopt(
@@ -1396,8 +1398,7 @@ cdef class Loop:
     def set_debug(self, enabled):
         self._debug = bool(enabled)
         if self.is_running():
-            self.call_soon_threadsafe(
-                self._set_coroutine_debug, self, self._debug)
+             self.call_soon_threadsafe(self._set_coroutine_debug, self._debug)
 
     def is_running(self):
         """Return whether the event loop is currently running."""
@@ -1411,19 +1412,35 @@ cdef class Loop:
         """Create a Future object attached to the loop."""
         return self._new_future()
 
-    def create_task(self, coro, *, name=None):
+    def create_task(self, coro, *, name=None, context=None):
         """Schedule a coroutine object.
 
         Return a task object.
 
         If name is not None, task.set_name(name) will be called if the task
-        object has the set_name attribute, true for default Task in Python 3.8.
+        object has the set_name attribute, true for default Task in CPython.
+
+        An optional keyword-only context argument allows specifying a custom
+        contextvars.Context for the coro to run in. The current context copy is
+        created when no context is provided.
         """
         self._check_closed()
-        if self._task_factory is None:
-            task = aio_Task(coro, loop=self)
+        if PY311:
+            if self._task_factory is None:
+                task = aio_Task(coro, loop=self, context=context)
+            else:
+                task = self._task_factory(self, coro, context=context)
         else:
-            task = self._task_factory(self, coro)
+            if context is None:
+                if self._task_factory is None:
+                    task = aio_Task(coro, loop=self)
+                else:
+                    task = self._task_factory(self, coro)
+            else:
+                if self._task_factory is None:
+                    task = context.run(aio_Task, coro, self)
+                else:
+                    task = context.run(self._task_factory, self, coro)
 
         # copied from asyncio.tasks._set_task_name (bpo-34270)
         if name is not None:
@@ -1507,9 +1524,7 @@ cdef class Loop:
         addr = __static_getaddrinfo_pyaddr(host, port, family,
                                            type, proto, flags)
         if addr is not None:
-            fut = self._new_future()
-            fut.set_result([addr])
-            return await fut
+            return [addr]
 
         return await self._getaddrinfo(
             host, port, family, type, proto, flags, 1)
@@ -1692,7 +1707,10 @@ cdef class Loop:
                     'host/port and sock can not be specified at the same time')
             return await self.create_unix_server(
                 protocol_factory, sock=sock, backlog=backlog, ssl=ssl,
-                start_serving=start_serving)
+                start_serving=start_serving,
+                # asyncio won't clean up socket file using create_server() API
+                cleanup_socket=False,
+            )
 
         server = Server(self)
 
@@ -1755,12 +1773,13 @@ cdef class Loop:
                                     addrinfo.ai_family,
                                     addrinfo.ai_socktype,
                                     addrinfo.ai_protocol, exc_info=True)
+                            addrinfo = addrinfo.ai_next
                             continue
 
                         if reuse_address:
                             sock.setsockopt(uv.SOL_SOCKET, uv.SO_REUSEADDR, 1)
                         if reuse_port:
-                            sock.setsockopt(uv.SOL_SOCKET, uv.SO_REUSEPORT, 1)
+                            sock.setsockopt(uv.SOL_SOCKET, SO_REUSEPORT, 1)
                         # Disable IPv4/IPv6 dual stack support (enabled by
                         # default on Linux) which makes a single socket
                         # listen on both address families.
@@ -2076,7 +2095,7 @@ cdef class Loop:
                                  *, backlog=100, sock=None, ssl=None,
                                  ssl_handshake_timeout=None,
                                  ssl_shutdown_timeout=None,
-                                 start_serving=True):
+                                 start_serving=True, cleanup_socket=PY313):
         """A coroutine which creates a UNIX Domain Socket server.
 
         The return value is a Server object, which can be used to stop
@@ -2101,6 +2120,11 @@ cdef class Loop:
         ssl_shutdown_timeout is the time in seconds that an SSL server
         will wait for completion of the SSL shutdown before aborting the
         connection. Default is 30s.
+
+        If *cleanup_socket* is true then the Unix socket will automatically
+        be removed from the filesystem when the server is closed, unless the
+        socket has been replaced after the server has been created.
+        This defaults to True on Python 3.13 and above, or False otherwise.
         """
         cdef:
             UnixServer pipe
@@ -2177,6 +2201,15 @@ cdef class Loop:
             # libuv will set the socket to non-blocking mode, but
             # we want Python socket object to notice that.
             sock.setblocking(False)
+
+        if cleanup_socket:
+            path = sock.getsockname()
+            # Check for abstract socket. `str` and `bytes` paths are supported.
+            if path[0] not in (0, '\x00'):
+                try:
+                    self._unix_server_sockets[sock] = os_stat(path).st_ino
+                except FileNotFoundError:
+                    pass
 
         pipe = UnixServer.new(
             self, protocol_factory, server, backlog,
@@ -2602,6 +2635,18 @@ cdef class Loop:
             socket_dec_io_ref(sock)
 
     @cython.iterable_coroutine
+    async def sock_recvfrom(self, sock, bufsize):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
+    async def sock_recvfrom_into(self, sock, buf, nbytes=0):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
+    async def sock_sendto(self, sock, data, address):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
     async def connect_accepted_socket(self, protocol_factory, sock, *,
                                       ssl=None,
                                       ssl_handshake_timeout=None,
@@ -2722,8 +2767,7 @@ cdef class Loop:
                                start_new_session=False,
                                executable=None,
                                pass_fds=(),
-                               # For tests only! Do not use in your code. Ever.
-                               __uvloop_sleep_after_fork=False):
+                               **kwargs):
 
         # TODO: Implement close_fds (might not be very important in
         # Python 3.5, since all FDs aren't inheritable by default.)
@@ -2743,8 +2787,12 @@ cdef class Loop:
         if executable is not None:
             args[0] = executable
 
-        if __uvloop_sleep_after_fork:
+        # For tests only! Do not use in your code. Ever.
+        if kwargs.pop("__uvloop_sleep_after_fork", False):
             debug_flags |= __PROCESS_DEBUG_SLEEP_AFTER_FORK
+        if kwargs:
+            raise ValueError(
+                'unexpected kwargs: {}'.format(', '.join(kwargs.keys())))
 
         waiter = self._new_future()
         protocol = protocol_factory()
@@ -3116,6 +3164,19 @@ cdef class Loop:
         await waiter
         return udp, protocol
 
+    def _monitor_fs(self, path: str, callback) -> asyncio.Handle:
+        cdef:
+            UVFSEvent fs_handle
+            char* c_str_path
+
+        self._check_closed()
+        fs_handle = UVFSEvent.new(self, callback, None)
+        p_bytes = path.encode('UTF-8')
+        c_str_path = p_bytes
+        flags = 0
+        fs_handle.start(c_str_path, flags)
+        return fs_handle
+
     def _check_default_executor(self):
         if self._executor_shutdown_called:
             raise RuntimeError('Executor shutdown has been called')
@@ -3160,8 +3221,13 @@ cdef class Loop:
                 })
 
     @cython.iterable_coroutine
-    async def shutdown_default_executor(self):
-        """Schedule the shutdown of the default executor."""
+    async def shutdown_default_executor(self, timeout=None):
+        """Schedule the shutdown of the default executor.
+
+        The timeout parameter specifies the amount of time the executor will
+        be given to finish joining. The default value is None, which means
+        that the executor will be given an unlimited amount of time.
+        """
         self._executor_shutdown_called = True
         if self._default_executor is None:
             return
@@ -3171,7 +3237,16 @@ cdef class Loop:
         try:
             await future
         finally:
-            thread.join()
+            thread.join(timeout)
+
+        if thread.is_alive():
+            warnings_warn(
+                "The executor did not finishing joining "
+                f"its threads within {timeout} seconds.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            self._default_executor.shutdown(wait=False)
 
     def _do_shutdown(self, future):
         try:
@@ -3181,9 +3256,24 @@ cdef class Loop:
             self.call_soon_threadsafe(future.set_exception, ex)
 
 
-cdef void __loop_alloc_buffer(uv.uv_handle_t* uvhandle,
-                              size_t suggested_size,
-                              uv.uv_buf_t* buf) with gil:
+# Expose pointer for integration with other C-extensions
+def libuv_get_loop_t_ptr(loop):
+    return PyCapsule_New(<void *>(<Loop>loop).uvloop, NULL, NULL)
+
+
+def libuv_get_version():
+    return uv.uv_version()
+
+
+def _testhelper_unwrap_capsuled_pointer(obj):
+    return <uint64_t>PyCapsule_GetPointer(obj, NULL)
+
+
+cdef void __loop_alloc_buffer(
+    uv.uv_handle_t* uvhandle,
+    size_t suggested_size,
+    uv.uv_buf_t* buf
+) noexcept with gil:
     cdef:
         Loop loop = (<UVHandle>uvhandle.data)._loop
 
@@ -3264,6 +3354,7 @@ include "handles/streamserver.pyx"
 include "handles/tcp.pyx"
 include "handles/pipe.pyx"
 include "handles/process.pyx"
+include "handles/fsevent.pyx"
 
 include "request.pyx"
 include "dns.pyx"
@@ -3280,10 +3371,7 @@ cdef vint __forking = 0
 cdef Loop __forking_loop = None
 
 
-cdef void __get_fork_handler() nogil:
-    global __forking
-    global __forking_loop
-
+cdef void __get_fork_handler() noexcept nogil:
     with gil:
         if (__forking and __forking_loop is not None and
                 __forking_loop.active_process_handler is not None):
@@ -3291,6 +3379,7 @@ cdef void __get_fork_handler() nogil:
 
 cdef __install_atfork():
     global __atfork_installed
+
     if __atfork_installed:
         return
     __atfork_installed = 1
